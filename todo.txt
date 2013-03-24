@@ -1,0 +1,7 @@
+- log to mongodb!
+- finish election
+- send leader address to client
+- do two phase commit
+- write log file
+- sync total data
+- sync partial data

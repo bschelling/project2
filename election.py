@@ -58,7 +58,6 @@ def main():
 	#I'm the leader
 	if prev_path == None:
 		print "OK I'm leader don't have to watch"
-		zk.stop()
 		return
 
 	#fires twice, once on creation ignore
@@ -74,8 +73,6 @@ def main():
 	print "boom. watch triggered?"
 	#time.sleep(10)
 	print "bye"
-
-
 
 	zk.stop()
 
