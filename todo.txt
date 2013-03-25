@@ -9,8 +9,21 @@
 - use logrotation and compression!
 
 check different use cases:
+	startup:
+		if !is primary:
+			get op log and replay database
+			set ephemeral node or notify primary zerorpc
+	Replica errors:
 	ready fails
+		see if child is alive - retry
+
 	commit fails
+		identify child:
+			if child is still alive, restart child remotely
+			else
+			wait for child to restart and sync operations log
+
+	Primary error:
 
 	everybody child watches on ready
 		new node comes up

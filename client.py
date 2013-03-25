@@ -35,6 +35,8 @@ class storageClient(object):
 				for i in range(1,max):
 					result = server.connection.kv_set("hello"+str(i),"world"+str(i),self.addr)
 					print i, server.addr, result
+					if result == 0:
+						break
 				print i, "requests sent", time.time() - a
 				break
 
