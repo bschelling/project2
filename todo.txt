@@ -5,3 +5,16 @@
 - write log file
 - sync total data
 - sync partial data
+- encode values in a better way
+- use logrotation and compression!
+
+check different use cases:
+	ready fails
+	commit fails
+
+	everybody child watches on ready
+		new node comes up
+		gets operations log from master
+		updates database
+		sets ephemeral node
+

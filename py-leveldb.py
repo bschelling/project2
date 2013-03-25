@@ -10,8 +10,9 @@ def batchTest():
 	print "put ", i
 	print db.Get("hello"+str(i-100))
 
-def dummy(db):
+def dummy():
 	# single put
+	db = leveldb.LevelDB('./db')
 	db.Put('hello', 'world')
 	print db.Get('hello')
 	# single delete
@@ -20,4 +21,4 @@ def dummy(db):
 
 
 
-batchTest()
+dummy()
