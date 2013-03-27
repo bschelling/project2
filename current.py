@@ -1,4 +1,5 @@
 #!/usr/local/bin/python2.7
+import inspect
 from kazoo.client import KazooClient
 from kazoo.recipe.watchers import PatientChildrenWatch
 import time
@@ -25,7 +26,7 @@ class storageServer(object):
 		rename transaction to prepare path
 	'''
 	def __init__(self,  addr, config_file='server_config'):
-
+		self.file_transmitsize = 1024 * 1024 * 1 #bytes offset
 
 		self.storage_prefix = "/storageserver/tx"
 		self.commit_prefix = "/storageserver/cx"
@@ -156,20 +157,27 @@ class storageServer(object):
 				self.status == self.stati["Reorganisation"]
 				#wait for child to restart and get the operations log
 
-	def primary_transmit_oplog(self, remote_addr):
+
+
+
+	def primary_transmit_oplog(self, remote_addr, offset):
 		#todo check if its faster to send per line, check http://effbot.org/zone/readline-performance.htm
 		#todo add checksum, compression
 		content = "-1"
-		fname = "operations"+addr[-1:]+".log"
+		#fname = "operations"+addr[-1:]+".log"
+		fname ="test_perf.log"
 		if os.path.isfile(fname):
 			file = open(fname)
-			content = file.read()
+			file.seek(offset)
+			content = file.readlines( self.file_transmitsize )
+
 			my_logger.debug("%s returning oplog with len %s to %s", self.addr, len(content), remote_addr)
+		else:
+			my_logger.debug("%s file  %s not available", self.addr, fname)
+
 		return content
 
 	def backup_get_oplog(self, primary_addr):
-		my_logger.debug("%s got primary %s", self.addr, primary_addr)
-
 		if primary_addr == self.addr:
 			my_logger.debug("%s i am primary %s", self.addr, primary_addr)
 			return
@@ -178,9 +186,28 @@ class storageServer(object):
 		for server in self.servers:
 			if server.addr == primary_addr:
 				my_logger.debug("%s trying to get oplog from %s",self.addr, primary_addr)
-				op_log = server.connection.primary_transmit_oplog(self.addr)
-				break
-		my_logger.debug("%s to oplog size %s",self.addr, len(op_log))
+				read_offset = 0
+				start = time.time()
+				rec_count = 1
+				while True:
+					readtupel = server.connection.primary_transmit_oplog(self.addr, read_offset)
+					if len(readtupel) == 0 or len(op_log) > 1024 * 1024 * 10:
+						print "end", len(op_log)
+						break
+					for line in readtupel:
+						op_log += line
+						self.db.Put("hello"+str(rec_count),line)
+						rec_count +=1
+						#my_logger.debug("%s got line %s", self.addr, line)
+						#self.db.put("a","b")
+					#print "got oplog", len(op_log)
+					read_offset += self.file_transmitsize
+				elapsed = time.time() - start
+
+		#open("op_log.log","w").write(op_log)
+		my_logger.debug("%s to oplog size %s time taken %s for transmitsize %s",self.addr
+			,len(op_log), elapsed, self.file_transmitsize)
+		#open("op_log.log","w").write(op_log)
 
 	def get_primary_addr(self):
 		children = self.zk.get_children("/ELECTION/")
@@ -327,14 +354,19 @@ class storageServer(object):
 		prev_path = None
 		tmp = sorted(children)
 		if tmp[0] == my_path:
-			print children, my_path
+			print "primary1",children, my_path
 			return my_path, self.addr
 		else:
+			#TODO 10 have to go until firs element here
 			for child_path in sorted(children):
 				if child_path == my_path:
+					print "primary2 my/prev",my_path, prev_path
 					break
-				prev_path = child_path
-			return prev_path, self.zk.get("/ELECTION/"+prev_path)[0]
+				else:
+					prev_path = child_path
+
+			print "returning prev, primary_addr ",prev_path, self.zk.get("/ELECTION/"+tmp[0])[0]
+			return prev_path, self.zk.get("/ELECTION/"+tmp[0])[0]
 
 	def watch_node(self, my_path, prev_path):
 		@self.zk.DataWatch("/ELECTION/"+prev_path)
@@ -348,9 +380,11 @@ class storageServer(object):
 					else:
 						if primary_addr != self.addr :
 							my_logger.debug("%s %s deleted but still not addmin, my_path %s prev_path %s ", self.addr, primary_addr, my_path, prev_path)
-							self.watch_node( prev_path )
-							self.set_primary( False )
+							self.watch_node( my_path, prev_path )
+							#TODO10 check for status change? something happened!!
+							#self.set_primary( False )
 						else:
+							my_logger.debug("%s hust. we got a problem set primary %s", self.addr, primary_addr)
 							#node still exists but we got the same address, emphemeral node still there
 							self.set_primary( True )
 
@@ -360,6 +394,7 @@ class storageServer(object):
 
 	#todo better use this than set values, check if we have to do
 	def set_primary(self, is_primary):
+		my_logger.debug("%s primary set from %s", self.addr, inspect.stack()[1][3])
 		self.is_primary = is_primary
 		if self.is_primary == False:
 			primary_addr = self.get_primary_addr()
@@ -380,11 +415,13 @@ class storageServer(object):
 		my_path  = self.zk.create("/ELECTION/"+self.addr, self.addr, ephemeral=True, sequence=True)
 		my_path = my_path.replace("/ELECTION/","")
 
-		prev_path, primary_addr = self.get_prev_path(my_path)
+		prev_path, primary_addr = self.get_prev_path( my_path )
+		print prev_path, primary_addr
 		if primary_addr != self.addr:
 			self.watch_node(my_path, prev_path)
 			self.set_primary(False)
 		else:
+
 			self.set_primary(True)
 
 

@@ -8,6 +8,10 @@
 - encode values in a better way
 - use logrotation and compression!
 
+deal with lockfiles!
+./db0/LOCK
+- does client need to contain a database?
+
 check different use cases:
 	startup:
 		if !is primary:
