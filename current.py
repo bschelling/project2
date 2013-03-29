@@ -16,8 +16,8 @@ from kazoo.client import KazooState
 import os
 from gevent.event import AsyncResult
 from gevent import monkey
+from gevent.queue import Queue, Empty
 monkey.patch_all()
-
 
 
 class storageServer(object):
@@ -58,6 +58,8 @@ class storageServer(object):
 		self.status = self.stati["Reorganisation"]
 		self.pending_transactions = {}
 		self.db = leveldb.LevelDB('./db'+str(self.i))
+		#create task queue optional specify max size
+		self.tasks = Queue()
 
 
 	def start(self):
@@ -67,6 +69,9 @@ class storageServer(object):
 		self.status = self.stati["Normal"]
 		self.start_election()
 		my_logger.debug("%s self.is_primary %s",self.addr, self.is_primary)
+
+
+
 
 	def primary_commit_watch(self, event):
 		children = self.zk.get_children(event.path, watch=self.primary_commit_watch)
@@ -83,13 +88,11 @@ class storageServer(object):
 					data = str(self.zk.get(commit_path)[0])
 					key , value = data.split("=")
 					#todo use base64encode
-					op_logger.debug("%s  %s  %s", commit_path, key, value)
-
+					op_logger.debug("%s  %s	 %s", commit_path, key, value)
 					self.zk.create(commit_path+"/ready")
-
 					#todo10 maybe nicer way to do this?
-					self.g_setter.args = "1"
-					self.g_setter.start()
+
+					self.tasks.put("commited")
 					#my_logger.debug("%s spawned setter ", self.addr)
 				else:
 					children = self.zk.get_children(event.path, watch=self.primary_commit_watch)
@@ -114,7 +117,7 @@ class storageServer(object):
 					self.zk.create(event.path+"/ready", acl=None, ephemeral=True, sequence=False, makepath=False)
 				else:
 					children = self.zk.get_children(event.path, watch=self.primary_prepare_watch)
-					#my_logger.debug("%s resetting watch for %s children is  %s", self.addr, event.path, children)
+					#my_logger.debug("%s resetting watch for %s children is	 %s", self.addr, event.path, children)
 			else:
 				my_logger.debug("%s reset watch event %s ", self.addr, event)
 				children = self.zk.get_children(event.path, watch=self.primary_prepare_watch)
@@ -124,40 +127,30 @@ class storageServer(object):
 			my_logger.debug(" %s Couldn't do it: %s", self.addr, e)
 			raise SystemError
 
-	def setter(self, status):
-		#my_logger.debug("%s setting status for waiter %s ", self.addr,  status)
-		self.a.set(status)
-		return
 
-	def waiter(self):
-		status = self.a.get()
-		#my_logger.debug("%s returning status  %s ", self.addr,  status)
-		return status
+	def status_handler(self):
+		task = ""
+		try:
+			while True:
+				task = self.tasks.get( timeout=2 ) # decrements queue size by 1
+				gevent.sleep(0)
+				if task == "commited" or task == "failed":
+					break
+			#ok our workflow is complete
+			return task
 
-	#runs as greenlet check if prepare worked...
-	def primary_result_check(self, prepare_path, commit_path):
-		gevent.sleep(1)
-		prepare_ok = self.zk.exists(prepare_path+"/ready")
+		except Empty:
+			print('Quitting time!')
+			#somethings missing check where we left off
+			print task
 
-		#todo let client retry up to count times
-		if prepare_ok is None:
-			self.g_setter.args = "0"
-			self.g_setter.start()
-			self.status == self.stati["Reorganisation"]
-			children = self.zk.get_children(commit_path)
-			my_logger.debug(" %s prepare failed  %s", self.addr, children)
-
+	def handle_error(self, laststage, prepare_path, commit_path):
+		if laststage == "prepare":
+			children = self.zk.get_children(prepare_path)
 		else:
-			commit_ok = self.zk.exists(commit_path+"/ready")
-			if commit_ok is None:
-				children = self.zk.get_children(commit_path)
-				my_logger.debug(" %s commit failed!  %s", self.addr, children)
-				self.g_setter.args = "0"
-				self.g_setter.start()
-				self.status == self.stati["Reorganisation"]
-				#wait for child to restart and get the operations log
-
-
+			children = self.zk.get_children(commit_path)
+		my_logger.debug(" %s error failed  %s, children %s", self.addr, laststage, children)
+		self.status == self.stati["Reorganisation"]
 
 
 	def primary_transmit_oplog(self, remote_addr, offset):
@@ -226,30 +219,27 @@ class storageServer(object):
 				return 0
 
 			my_logger.debug(" %s started handling request from  %s", self.addr, remote_addr)
+			self.g_status_handler = gevent.Greenlet(self.status_handler)
+			self.g_status_handler.start()
+			self.tasks.put("handling")
 
-			self.a = AsyncResult()
-			#don't start setter only initialize
-			self.g_setter = gevent.Greenlet(self.setter)
-
-			#todo check ephemeral maybe faster?
 			commit_path = str(self.zk.create(self.commit_prefix , key +"="+value , acl=None, ephemeral=False, sequence=True, makepath=True))
 			prepare_path = self.zk.create(self.storage_prefix, commit_path.encode('UTF-8') , acl=None, ephemeral=False, sequence=True, makepath=True)
-			self.g_primary_result_check = gevent.spawn(self.primary_result_check, prepare_path, commit_path )
 
 			children = self.zk.get_children(commit_path,watch=self.primary_commit_watch)
 			children = self.zk.get_children(prepare_path, watch=self.primary_prepare_watch)
 			prepare_ack = self.primary_prepare(prepare_path, commit_path, key, value)
+			self.tasks.put("prepareack"+str(prepare_ack))
 			if not prepare_ack:
 				my_logger.debug("%s prepare failed")
 				raise RuntimeError
 
-			self.g_waiter = gevent.spawn(self.waiter)
 			gevent.joinall([
-	    		self.g_setter,
-				self.g_waiter,
+				self.g_status_handler,
 			])
-			my_logger.debug("%s result received %s", self.addr, self.g_waiter.value)
-			return int(self.g_waiter.value)
+			my_logger.debug("%s result received %s", self.addr, self.g_status_handler.value)
+			#todo call self.handle_error if something went wrong
+			return self.g_status_handler.value
 
 		else:
 			my_logger.debug("%s sorry not primary", self.addr)
@@ -272,7 +262,7 @@ class storageServer(object):
 		for server in self.servers:
 			if server.addr != self.addr:
 				try:
-					commited = server.connection.kv_commit(self.addr, self.transaction_id,  key, value)
+					commited = server.connection.kv_commit(self.addr, self.transaction_id,	key, value)
 				except zerorpc.TimeoutExpired:
 					my_logger.debug('%s : timeout from %s', self.addr, server.addr)
 					commited = False
@@ -396,7 +386,7 @@ class storageServer(object):
 	def set_primary(self, is_primary):
 		my_logger.debug("%s primary set from %s", self.addr, inspect.stack()[1][3])
 		self.is_primary = is_primary
-		if self.is_primary == False:
+		if False and self.is_primary == False:
 			primary_addr = self.get_primary_addr()
 			if primary_addr != "":
 				self.backup_get_oplog(primary_addr)
@@ -412,7 +402,7 @@ class storageServer(object):
 		if self.zk.exists("/ELECTION") is None:
 			self.zk.ensure_path("/ELECTION")
 
-		my_path  = self.zk.create("/ELECTION/"+self.addr, self.addr, ephemeral=True, sequence=True)
+		my_path	 = self.zk.create("/ELECTION/"+self.addr, self.addr, ephemeral=True, sequence=True)
 		my_path = my_path.replace("/ELECTION/","")
 
 		prev_path, primary_addr = self.get_prev_path( my_path )
@@ -426,7 +416,7 @@ class storageServer(object):
 
 
 if __name__ == '__main__':
-	addr =  sys.argv[1]
+	addr =	sys.argv[1]
 
 
 	my_logger = logging.getLogger("storagelogger")
@@ -444,7 +434,7 @@ if __name__ == '__main__':
 
 	op_logger = logging.getLogger("oplogger")
 	op_logger.setLevel(logging.DEBUG)
-	fop = logging.FileHandler("operations"+addr[-1:]+".log", mode="a")
+	fop = logging.FileHandler("operations"+addr[-1:]+".log", mode="w")
 	fop_formatter = logging.Formatter('[%(asctime)s] %(message)s')
 	fop.setFormatter(fop_formatter)
 	op_logger.addHandler(fop)
