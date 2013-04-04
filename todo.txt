@@ -12,6 +12,9 @@ deal with lockfiles!
 ./db0/LOCK
 - does client need to contain a database?
 
+better communication with client, return tuple of what to do!
+order of read and write requests
+
 testcase:
 	primary alone, deny, add a backup, accept
 

@@ -36,7 +36,9 @@ class storageClient(object):
 					result = server.connection.kv_set("hello"+str(i),"world"+str(i),self.addr)
 					print i, server.addr, result
 					if result !="commited":
-						break
+						dummy = 1
+						#time.sleep(1)
+						#break
 				print i, "requests sent", time.time() - a
 				break
 
