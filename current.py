@@ -14,7 +14,6 @@ import leveldb
 import kazoo
 from kazoo.client import KazooState
 import os
-from gevent.event import AsyncResult
 from gevent import monkey
 from gevent.queue import Queue, Empty
 monkey.patch_all()
@@ -27,7 +26,7 @@ class storageServer(object):
 	'''
 	def __init__(self,  addr, config_file='server_config'):
 		self.file_transmitsize = 1024 * 1024 * 1 #bytes offset
-
+		self.quorum_size = 1
 		self.storage_prefix = "/storageserver/tx"
 		self.commit_prefix = "/storageserver/cx"
 		self.addr = addr
@@ -36,10 +35,16 @@ class storageServer(object):
 		self.i = 0
 		self.is_primary = False
 		self.servers = []
+		self.server_stati ={}
+		self.uplist = set()
+
+
 		self.stati = {"Down": 0, "Election": 1, "Reorganisation": 2, "Normal": 3}
 		self.t_stati = {"Ready": 0, "Commited": 2, "Rolledback":3}
 		self.status = self.stati["Down"]
-		ntconnection = collections.namedtuple('ntconnection', 'addr connection prio status')
+
+		#check if we want to use this http://stackoverflow.com/questions/2970608/what-are-named-tuples-in-python
+		ntconnection = collections.namedtuple('ntconnection', 'addr connection prio')
 		f = open(config_file, 'r')
 		i = 0
 		for line in f.readlines():
@@ -48,11 +53,15 @@ class storageServer(object):
 				self.i = i
 				connection = self
 			else:
-				connection = zerorpc.Client()
+				#TODO check for connection down at startup
+				connection = zerorpc.Client(timeout=1)
 				connection.connect('tcp://' + line)
+				my_logger.debug("%s server %s added as up!",self.addr, line)
+				#
+				self.server_stati[line]="up"
+				self.uplist.add(i)
 
-			#todo to we need an uplist here?
-			self.servers.append(ntconnection(line,connection,i,"up"))
+			self.servers.append(ntconnection(line,connection,i))
 			i+=1
 
 		self.status = self.stati["Reorganisation"]
@@ -71,35 +80,50 @@ class storageServer(object):
 		my_logger.debug("%s self.is_primary %s",self.addr, self.is_primary)
 
 
-
-
 	def primary_commit_watch(self, event):
 		children = self.zk.get_children(event.path, watch=self.primary_commit_watch)
-		#my_logger.debug("%s got a commit from %s children %s", self.addr, event, children)
+		#my_logger.debug("%s >>>>>>>>>>>>>>>>>>> %s <<<<<<<<<<<<<<", self.addr, event)
+		#my_logger.debug("%s  commit watch on %s children %s", self.addr, event.path, children)
 		try:
-			if event.type == "CHILD":
-				if len(children) == len(self.servers) - 1:
-					if not self.zk.exists(event.path+"/ready") is None:
-						my_logger.debug("%s commit useless watch %s", self.addr, len(children) )
-						return
+			if event.type == "DELETED":
+				my_logger.debug(" %s primary_commit_watch deleted %s", self.addr, event)
+				return
 
-					my_logger.debug("%s commit successfull children %s", self.addr, len(children) )
-					commit_path = str(event.path)
-					data = str(self.zk.get(commit_path)[0])
-					key , value = data.split("=")
-					#todo use base64encode
-					op_logger.debug("%s  %s	 %s", commit_path, key, value)
-					self.zk.create(commit_path+"/ready")
-					#todo10 maybe nicer way to do this?
-
-					self.tasks.put("commited")
-					#my_logger.debug("%s spawned setter ", self.addr)
+			elif event.type == "CHILD":
+				if not self.zk.exists(event.path+"/ready") is None:
+					my_logger.debug("%s ready path exists on %s returning", self.addr, event.path)
+					return
 				else:
-					children = self.zk.get_children(event.path, watch=self.primary_commit_watch)
+					if len(children) >= self.quorum_size:
+						my_logger.debug("%s commit successfull children %s", self.addr, len(children) )
+						commit_path = str(event.path)
+						data = str(self.zk.get(commit_path)[0])
+						key , value = data.split("=")
+						#todo use base64encode
+						op_logger.debug("%s  %s	 %s", commit_path, key, value)
+						self.zk.create(commit_path+"/ready")
+						self.tasks.put("commited")
+
+					else:
+						my_logger.debug("%s got a commit event  %s children %s, quorum not reached yet %s quorum_size"
+							, self.addr, event, children, self.quorum_size)
+						#children = self.zk.get_children(event.path, watch=self.primary_commit_watch)
+
+			elif event.type == "CREATED":
+				my_logger.debug("%s got event %s ",self.addr, event)
+				if  event.path.find("/ready")!=-1:
+					my_logger.debug("%s discarding create event  %s ",self.addr, event)
+					return
+
 			else:
-				my_logger.debug("%s reset watch event %s ", self.addr, event)
+				#tocheck do we ever reach this
+				my_logger.debug("%s reset watch event not child? %s ", self.addr, event)
 				children = self.zk.get_children(event.path, watch=self.primary_commit_watch)
-				my_logger.debug("%s children %s ", self.addr, children)
+				if len(children) >= self.quorum_size:
+					my_logger.debug("%s returning, children bigger quorum size  %s ", self.addr, len(children))
+					return
+				my_logger.debug("%s resetted watch children %s ", self.addr, children)
+
 
 		except Exception, e:
 			my_logger.debug(" %s Couldn't do it: %s", self.addr, e)
@@ -108,18 +132,39 @@ class storageServer(object):
 
 	def primary_prepare_watch(self, event):
 		#my_logger.debug(" %s primary_prepare_watch called %s", self.addr, event)
-		children = self.zk.get_children(event.path, watch=self.primary_prepare_watch)
 		try:
-			if event.type == "CHILD":
-				children = self.zk.get_children(event.path)
-				if len(children) == len(self.servers) - 1:
-					#my_logger.debug("%s adding ready node to prepare path %s ", self.addr, event.path)
+			if event.type == "DELETED":
+				my_logger.debug(" %s primary_prepare_watch deleted %s", self.addr, event)
+				return
+
+			elif event.type == "CHILD":
+				#yeah weird but exists is not boolean!
+				if not self.zk.exists(event.path+"/ready") is None:
+					my_logger.debug("%s ready path already exists", self.addr)
+					return
+
+				#reset the watch immediately or we will be missing something!
+				children = self.zk.get_children(event.path, watch=self.primary_prepare_watch)
+				if len(children) == len(self.servers)-1:
+					my_logger.debug("%s adding ready node to prepare path %s len self.servers-1 %s children is %s "
+						, self.addr, event.path, len(self.servers)-1, children)
 					self.zk.create(event.path+"/ready", acl=None, ephemeral=True, sequence=False, makepath=False)
+					self.tasks.put("prepare_ready")
+					return
+
 				else:
-					children = self.zk.get_children(event.path, watch=self.primary_prepare_watch)
-					#my_logger.debug("%s resetting watch for %s children is	 %s", self.addr, event.path, children)
+					my_logger.debug("%s prepare waiting  %s children is %s uplist  is %s "
+						, self.addr, event.path, children, str(self.uplist))
+
+			#triggered by exists watch ignore
+			elif event.type == "CREATED":
+				my_logger.debug("%s got event %s ",self.addr, event)
+				if  event.path.find("/ready") != -1:
+					my_logger.debug("%s discarding create event  %s ",self.addr, event)
+					return
+
 			else:
-				my_logger.debug("%s reset watch event %s ", self.addr, event)
+				my_logger.debug("%s ??? reset watch event %s ", self.addr, event)
 				children = self.zk.get_children(event.path, watch=self.primary_prepare_watch)
 				#my_logger.debug("%s ATTENTION children here? %s ", self.addr, children)
 
@@ -132,7 +177,8 @@ class storageServer(object):
 		task = ""
 		try:
 			while True:
-				task = self.tasks.get( timeout=2 ) # decrements queue size by 1
+				task = self.tasks.get( timeout=3 ) # decrements queue size by 1
+				my_logger.debug(" %s got task %s", self.addr, task)
 				gevent.sleep(0)
 				if task == "commited" or task == "failed":
 					break
@@ -143,14 +189,31 @@ class storageServer(object):
 			print('Quitting time!')
 			#somethings missing check where we left off
 			print task
+			return task
 
-	def handle_error(self, laststage, prepare_path, commit_path):
-		if laststage == "prepare":
-			children = self.zk.get_children(prepare_path)
-		else:
-			children = self.zk.get_children(commit_path)
-		my_logger.debug(" %s error failed  %s, children %s", self.addr, laststage, children)
-		self.status == self.stati["Reorganisation"]
+	def kv_set_cleanup(self, laststage, prepare_path, commit_path):
+		#todo remove children that didn't succeed from uplist
+		# if no quorum got to reorganisation
+		if False:
+			if laststage == "handle":
+				dummy = 1
+			elif laststage == "prepare":
+				children = self.zk.get_children(prepare_path)
+			else:
+				children = self.zk.get_children(commit_path)
+
+	#def dummy(self):
+		try:
+			my_logger.debug("%s deleting commit path %s and prepare path %s ", self.addr, prepare_path, commit_path)
+			self.zk.delete(prepare_path,recursive=True)
+			#self.zk.delete(commit_path,recursive=True)
+
+		except Exception, e:
+			my_logger.debug(" %s Couldn't do it: %s", self.addr, e)
+			raise SystemError
+
+
+		return
 
 
 	def primary_transmit_oplog(self, remote_addr, offset):
@@ -214,7 +277,10 @@ class storageServer(object):
 		return primary_addr
 
 	def kv_set(self, key, value, remote_addr):
+
 		if self.is_primary:
+			#todo check if we have quorum before checking request?
+			# todo keep a lock , check if we should spawn greenlet per request
 			if self.status != self.stati["Normal"]:
 				return 0
 
@@ -227,17 +293,32 @@ class storageServer(object):
 			prepare_path = self.zk.create(self.storage_prefix, commit_path.encode('UTF-8') , acl=None, ephemeral=False, sequence=True, makepath=True)
 
 			children = self.zk.get_children(commit_path,watch=self.primary_commit_watch)
+			if len(children) > 0:
+				my_logger.debug("%s somethings very wrong here", self.addr)
+				raise SystemError
+
 			children = self.zk.get_children(prepare_path, watch=self.primary_prepare_watch)
-			prepare_ack = self.primary_prepare(prepare_path, commit_path, key, value)
-			self.tasks.put("prepareack"+str(prepare_ack))
-			if not prepare_ack:
-				my_logger.debug("%s prepare failed")
-				raise RuntimeError
+			prepare_acks = self.primary_prepare(prepare_path, commit_path, key, value)
+			self.tasks.put("prepareacks"+str(prepare_acks))
+
+			if prepare_acks < self.quorum_size:
+				my_logger.debug("%s prepare failed  prepare_acks %s quorumsize %s ",self.addr,  prepare_acks, self.quorum_size)
+				my_logger.debug("%s prepare failed %s %s", self.addr, str(self.server_stati), self.uplist)
+				self.tasks.put("failed")
+			else:
+				#we still have enough supporters, trigger the prepare watch myself
+				for addr, status in self.server_stati.iteritems():
+					if status == "down":
+						#use primary addr here to distinguish
+						path = self.zk.create(prepare_path+"/"+self.addr, self.addr, acl=None, ephemeral=False, sequence=True, makepath=True)
 
 			gevent.joinall([
 				self.g_status_handler,
 			])
 			my_logger.debug("%s result received %s", self.addr, self.g_status_handler.value)
+
+			self.kv_set_cleanup(self.g_status_handler.value, prepare_path, commit_path)
+
 			#todo call self.handle_error if something went wrong
 			return self.g_status_handler.value
 
@@ -246,16 +327,19 @@ class storageServer(object):
 			return 0
 
 	def primary_prepare(self, prepare_path, commit_path, key, value):
-		prepare_ack = False
+		prepare_acks = 0
 		for server in self.servers:
-			if server.addr != self.addr:
+			if server.addr != self.addr and self.server_stati[server.addr]=="up":
 				try:
-					prepare_ack  = server.connection.backup_kv_prepare(self.addr, prepare_path, commit_path, key, value)
+					prepare_ok  = server.connection.backup_kv_prepare(self.addr, prepare_path, commit_path, key, value)
+					if prepare_ok :
+						prepare_acks += 1
 				except zerorpc.TimeoutExpired:
-					my_logger.debug('%s : timeout from %s', self.addr, server.addr)
-					prepare_ack = False
-					break
-		return prepare_ack
+					self.server_stati[server.addr]="down"
+					self.uplist.discard(server.prio)
+					my_logger.debug('%s : timeout from %s uplist now %s ', self.addr, server.addr, str(self.uplist))
+
+		return prepare_acks
 
 	def primary_commit(self, transaction_id):
 		commited = False
@@ -277,10 +361,19 @@ class storageServer(object):
 			raise SystemError
 		else:
 			try:
+				if self.zk.exists(prepare_path) is None:
+					my_logger.debug("%s this prepare_path %s doesnt exist anymore, returning "
+						,self.addr, prepare_path+"/"+self.addr )
+					return
+
 				# create and trigger primary_prepare_watch
+				# check we coul have gotten an old message here, check if the prepare path still exists!
 				my_logger.debug("%s creating prepare node  adding exists watcher to%s ",self.addr, prepare_path+"/"+self.addr )
+
+
+
 				self.zk.exists(prepare_path+"/ready", watch=self.backup_kv_commit_watcher)
-				path = self.zk.create(prepare_path+"/"+self.addr, self.addr, acl=None, ephemeral=False, sequence=True, makepath=True)
+				path = self.zk.create(prepare_path+"/"+self.addr, self.addr, acl=None, ephemeral=False, sequence=True, makepath=False)
 				return True
 
 			except Exception, e:
@@ -382,14 +475,39 @@ class storageServer(object):
 				my_logger.debug(" %s Couldn't do it: %s", self.addr, e)
 				raise SystemError
 
+	def backup_register(self, primary_addr):
+		for server in self.servers:
+			if server.addr == primary_addr:
+				try:
+					server.connection.primary_register(self.addr, self.i)
+				except zerorpc.TimeoutExpired:
+					my_logger.debug(" %s timeout checking primary %s", self.addr, primary_addr)
+
+	def primary_register(self, backup_addr, remote_prio):
+
+		#todo move this into function and make it atomic?
+		self.uplist.add(remote_prio)
+		self.server_stati[backup_addr] = "up"
+
+
+		my_logger.debug(" %s added remote prio %s to uplist, uplist now %s "
+			, self.addr, remote_prio, str(self.uplist))
+
+
 	#todo better use this than set values, check if we have to do
 	def set_primary(self, is_primary):
 		my_logger.debug("%s primary set from %s", self.addr, inspect.stack()[1][3])
 		self.is_primary = is_primary
-		if False and self.is_primary == False:
+		if  self.is_primary == False:
 			primary_addr = self.get_primary_addr()
 			if primary_addr != "":
-				self.backup_get_oplog(primary_addr)
+				#TODO update status to up only after we checked
+				#get oplog first and sync!
+				#self.backup_get_oplog(primary_addr)
+				self.backup_register( primary_addr )
+			else:
+				dummy = 1
+
 
 		#todo cleanup stuff
 		if False and self.is_primary:

@@ -12,11 +12,18 @@ deal with lockfiles!
 ./db0/LOCK
 - does client need to contain a database?
 
+testcase:
+	primary alone, deny, add a backup, accept
+
+
 check different use cases:
 	startup:
 		if !is primary:
 			get op log and replay database
 			set ephemeral node or notify primary zerorpc
+
+
+
 	Replica errors:
 	ready fails
 		see if child is alive - retry
