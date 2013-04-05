@@ -31,7 +31,10 @@ class storageServer(object):
 	'''
 
 	def __init__(self, addr, config_file='server_config'):
-		self.file_transmitsize = 1024 * 1024 * 1 #bytes offset
+
+		self.op_log = open("operations"+addr[-1:]+".log","w")
+
+		self.file_transmitsize = 1024 * 100  #bytes offset
 		self.quorum_size = 1
 		self.storage_prefix = "/storageserver/tx"
 		self.commit_prefix = "/storageserver/cx"
@@ -43,6 +46,8 @@ class storageServer(object):
 		self.servers = []
 		self.server_stati = {}
 		self.uplist = set()
+
+
 
 		self.stati = {"Down": 0, "Election": 1, "Reorganisation": 2, "Normal": 3}
 		self.t_stati = {"Ready": 0, "Commited": 2, "Rolledback": 3}
@@ -112,7 +117,7 @@ class storageServer(object):
 					value_enc = base64.b64encode( value )
 					m = hashlib.md5()
 					m.update(key_enc+value_enc)
-					op_logger.debug("%s %s %s %s", commit_path, key_enc, value_enc , m.hexdigest())
+					self.op_log.write(commit_path+" "+key_enc+" "+value_enc+" "+m.hexdigest())
 					self.tasks.put("commited")
 
 				else:
@@ -222,49 +227,80 @@ class storageServer(object):
 		return
 
 	#todo add checksum, compression
-	def primary_transmit_oplog(self, remote_addr, offset):
+	def primary_transmit_oplog(self, remote_addr, replica_size):
 
+		offset = replica_size
 		content = []
-		fname = "operations" + addr[-1:] + ".log"
+		#fname = "operations" + addr[-1:] + ".log"
+		fname = "log5000.txt"
 
+		#default transfer blocks
 		transmitsize = self.file_transmitsize
 		fsize = os.path.getsize(fname)
-		if fsize < transmitsize:
+		my_logger.debug("%s syncing to %s offset %s my_size %s replica_size %s", self.addr, remote_addr, offset, fsize, replica_size)
+
+		if fsize < offset :
+			my_logger.debug("%s argh what happened replica has bigger size %s", self.addr, remote_addr)
+			my_logger.debug("%s fsize %s replica_size %s",self.addr, fsize, replica_size)
+
+			raise SystemError
+
+		elif fsize == offset:
+			my_logger.debug("%s sync successfull fsize = replica_size", self.addr)
+			transmitsize = -1
+
+		elif fsize - offset < transmitsize:
 			#transfer the whole file in one block
-			transmitsize = fsize
-			offset = 0
+			my_logger.debug("%s only small bits missing", self.addr)
+			#read until the end of file!
+			transmitsize = 0
+
+		elif offset > fsize:
+			my_logger.debug("%s offset %s bigger than fsize %s"
+				, self.addr, offset, fsize)
+			transmitsize = -1
+			#todo check here!
+			raise SystemError
+
+		elif offset + transmitsize > fsize:
+			transmitsize = 0
+			my_logger.debug("%s offset + transmitsize %s bigger than fsize %s ")
+			my_logger.debug("%s new transmitsize set to  %s ", self.addr, transmitsize)
+
 		else:
-			if offset > fsize:
-				my_logger.debug("%s offset %s bigger than fsize %s"
-					, self.addr, offset, fsize)
-				return content
-
-			elif offset + transmitsize > fsize:
-				transmitsize = fsize - offset
-				my_logger.debug("%s offset + transmitsize %s bigger than fsize %s"
-					, self.addr, offset + transmitsize, fsize)
-			else:
-				transmitsize = self.file_transmitsize
-
+			transmitsize = self.file_transmitsize
 
 		my_logger.debug("%s remaining size of oplog to sync with %s is %s"
-			, self.addr, remote_addr, fsize - offset)
+			, self.addr, remote_addr,  fsize - replica_size)
 
-		if  transmitsize < self.file_transmitsize:
-			#signal server to wait!
-			self.wtasks.put(remote_addr)
+		#if transmitsize is 0 we will read until the end of file!
+		if (fsize - replica_size) < 1024 * 1024:
 			my_logger.debug("%s replica %s got close to catching up,only %s remaining"
-				, self.addr, remote_addr, transmitsize)
+							, self.addr, remote_addr, transmitsize)
+			try:
+				#todo better keep list in memory?
+				if self.zk.exists("/syncpath/"+remote_addr) is None:
+					self.zk.create("/syncpath/"+remote_addr, ephemeral=True, makepath=True)
+					my_logger.debug(">>>>>>>>>>>>>>>>>>>>>>>>>created<<<<"+"/syncpath/"+remote_addr)
+				else:
+					my_logger.debug(" %s node %s already exists?", self.addr, "/syncpath/"+remote_addr )
 
-		if os.path.isfile(fname):
-			file = open(fname)
-			file.seek(offset)
-			content = file.readlines(transmitsize)
-			my_logger.debug("%s returning oplog with len %s to %s"
-				, self.addr, len(content), remote_addr)
+			except Exception, e:
+				my_logger.debug(" %s Couldn't do it: %s", self.addr, e)
+				raise SystemError
 
-		else:
-			my_logger.debug("%s file  %s not available", self.addr, fname)
+		if transmitsize != -1:
+			if os.path.isfile(fname):
+				file = open(fname)
+				file.seek(offset)
+				content = file.readlines(transmitsize)
+				if transmitsize == 0:
+					open("debug.txt","w").write(str(content))
+
+				my_logger.debug("%s read file with offset %s and transmitsize %s"
+					, self.addr, offset, transmitsize, )
+			else:
+				my_logger.debug("%s file  %s not available", self.addr, fname)
 
 		return content
 
@@ -289,22 +325,19 @@ class storageServer(object):
 		p_connection = zerorpc.Client(timeout=30)
 		p_connection.connect('tcp://' + primary_addr)
 		retries = 0
-		max_retries = 1
+		max_retries = 0
 		read_offset = 0
 		start = time.time()
+		size_received = 0
 
 		#todo if oplogs are logrotated, we have to get the list of files first and loop through them here
+
 		while True:
+			my_logger.debug("%s send size received to server as %s"
+				, self.addr, size_received)
+			lines_tupel = p_connection.primary_transmit_oplog(self.addr, size_received )
+			gevent.sleep(1)
 
-			lines_tupel = p_connection.primary_transmit_oplog(self.addr, read_offset)
-			size_received = os.path.getsize("operations" + addr[-1:] + ".log")
-
-			my_logger.debug("%s size received %s tupel len %s"
-				, self.addr, size_received, len(lines_tupel))
-
-			print lines_tupel
-
-			#todo use some value for max_oplog size
 			if len(lines_tupel) == 0 or size_received > 1024 * 1024 * 10:
 				# retry will give the same line again if nothing changed at the primary
 				# since we have only puts and the order of inserts is not changed, np
@@ -316,34 +349,35 @@ class storageServer(object):
 					print "breaking out here."
 					break
 
-			#todo check for stricter format in logger?
 			for line in lines_tupel:
-				#line ="[2013-04-04 21:34:43,258] /storageserver/cx0000012585  hello13   world13"
-				print line
-				data = line[26:].rstrip()
-				print data
-				tid, key, value, digest = data.split(" ")
-				m = hashlib.md5()
-				m.update(key+value)
-				if m.hexdigest() == digest:
-					#todo try catch, put in separate function?
-					print base64.b64decode( key ), base64.b64decode( value )
-					self.db.Put(base64.b64decode( key ), base64.b64decode( value ))
-				else:
-					print data
-					print "X1"+digest+"X1",
-					print "X1"+m.hexdigest()+"X1"
-					raise SystemError
-				op_logger.debug("%s  %s	 %s", tid, key, value)
+				#line ="[2013-04-04 21:34:43,258] /storageserver/cx0000012585  hello13   world13 digest"
+				if False:
+					data = line[26:].rstrip()
+					tid, key, value, digest = data.split(" ")
+					m = hashlib.md5()
+					m.update(key+value)
+					if m.hexdigest() == digest:
+						#todo try catch, put in separate function?
+						self.db.Put(base64.b64decode( key ), base64.b64decode( value ))
+					else:
+						raise SystemError
+					self.op_log.write(tid+" "+key+" "+value+" "+m.hexdigest())
+
+			for line in lines_tupel:
+				if True:
+					self.op_log.write(line)
+					size_received += len(line)
+					#break
 
 			read_offset += self.file_transmitsize
+			#size_received = os.path.getsize("operations" + addr[-1:] + ".log")
 
 
-		# todo do some sanity checks on log here!
+		# TRANSMISSON DONE todo do some sanity checks on log here!
 		#todo ok one more time and this goes to init
 		elapsed = time.time() - start
 
-		size_received = os.path.getsize("operations" + addr[-1:] + ".log")
+		#size_received = os.path.getsize("operations" + addr[-1:] + ".log")
 		my_logger.debug("%s size received %s time elapsed %s using transmitsize %s", self.addr
 			, size_received, elapsed, self.file_transmitsize)
 
@@ -351,7 +385,7 @@ class storageServer(object):
 		#received from replica or find out ourselves and go back to recovery
 
 		#todo do verify here check rsync output use short lived connection?
-		right_oplog_version = p_connection.primary_register(size_received,self.addr, self.i)
+		right_oplog_version = p_connection.primary_register(size_received, self.addr, self.i)
 
 		if right_oplog_version:
 			self.status = self.stati["Normal"]
@@ -378,6 +412,10 @@ class storageServer(object):
 
 		if self.is_primary:
 			#check if a node is syncing on syncpath
+			if not self.zk.exists("/syncpath") is None:
+				children = self.zk.get_children("/syncpath")
+				if len(children) > 0:
+					return "syncing "+children
 
 			lock = self.zk.Lock("/lockpath", "my-identifier")
 			with lock:
@@ -557,15 +595,27 @@ class storageServer(object):
 
 
 	def primary_register(self, op_log_size, backup_addr, remote_prio):
+		try:
+			if not  self.zk.exists("/syncpath/"+backup_addr) is None:
+				self.zk.delete("/syncpath/"+backup_addr)
+			else:
+				my_logger.debug(" %s where is the fking node...%s ", self.addr, "/syncpath/"+backup_addr)
+
+		except Exception, e:
+			my_logger.debug(" %s Couldn't do it: %s", self.addr, e)
+			raise SystemError
 
 		#todo replace check for op_log size with call to verify
-		if op_log_size == os.path.getsize("operations" + addr[-1:] + ".log") :
+		#if op_log_size == os.path.getsize("operations" + addr[-1:] + ".log") :
+		if op_log_size == os.path.getsize("log5000.txt") :
 			#todo move this into function and make it atomic?
 			self.uplist.add(remote_prio)
 			self.server_stati[backup_addr] = "up"
 			my_logger.debug(" %s added remote prio %s to uplist, uplist now %s "
 				, self.addr, remote_prio, str(self.uplist))
 			return True
+		my_logger.debug(" %s size does not match oplogsize %s path size %s "
+				, self.addr, op_log_size, os.path.getsize("log5000.txt") )
 
 		return False
 
@@ -579,7 +629,7 @@ class storageServer(object):
 				todo = 1
 				#TODO update status to up only after we checked
 				#get oplog first and sync!
-				#self.backup_get_oplog(primary_addr)
+				self.backup_get_oplog(primary_addr)
 			#registered
 			#self.backup_register( primary_addr )
 			else:
@@ -618,12 +668,6 @@ if __name__ == '__main__':
 	fh.setFormatter(formatter)
 	my_logger.addHandler(fh)
 
-	op_logger = logging.getLogger("oplogger")
-	op_logger.setLevel(logging.DEBUG)
-	fop = logging.FileHandler("operations" + addr[-1:] + ".log", mode="w")
-	fop_formatter = logging.Formatter('[%(asctime)s] %(message)s')
-	fop.setFormatter(fop_formatter)
-	op_logger.addHandler(fop)
 
 	storageserver = storageServer(addr)
 	s = zerorpc.Server(storageserver)
