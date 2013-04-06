@@ -1,4 +1,5 @@
 #!/usr/local/bin/python2.7
+import traceback
 import hashlib
 import re
 import inspect
@@ -15,7 +16,11 @@ import collections
 import leveldb
 import kazoo
 from kazoo.client import KazooState
-from kazoo.recipe import lock
+#from kazoo.exceptions import KazooException
+#from kazoo.exceptions import NoNodeError
+#from kazoo.exceptions import NodeExistsError
+#from kazoo.recipe import lock
+from kazoo.exceptions import *
 import os
 from gevent import monkey
 from gevent.queue import Queue, Empty
@@ -32,9 +37,9 @@ class storageServer(object):
 
 	def __init__(self, addr, config_file='server_config'):
 
-		self.op_log = open("operations"+addr[-1:]+".log","w")
+		self.op_log = "operations"+addr[-1:]+".log"
 
-		self.file_transmitsize = 1024 * 100  #bytes offset
+		self.file_transmitsize = 1024 * 1024  #bytes offset
 		self.quorum_size = 1
 		self.storage_prefix = "/storageserver/tx"
 		self.commit_prefix = "/storageserver/cx"
@@ -64,7 +69,7 @@ class storageServer(object):
 				connection = self
 			else:
 				#TODO check for connection down at startup
-				connection = zerorpc.Client(timeout=0.1)
+				connection = zerorpc.Client(timeout=1)
 				connection.connect('tcp://' + line)
 				my_logger.debug("%s server %s added as up!", self.addr, line)
 				#
@@ -116,9 +121,12 @@ class storageServer(object):
 					key_enc = base64.b64encode( key )
 					value_enc = base64.b64encode( value )
 					m = hashlib.md5()
-					m.update(key_enc+value_enc)
-					self.op_log.write(commit_path+" "+key_enc+" "+value_enc+" "+m.hexdigest())
+					m.update(key_enc  +value_enc)
+					f = open(self.op_log,"a")
+					f.write(commit_path+" "+key_enc+" "+value_enc+" "+m.hexdigest()+"\n")
+					f.close()
 					self.tasks.put("commited")
+
 
 				else:
 					my_logger.debug("%s got a commit event  %s children %s, quorum not reached yet %s quorum_size"
@@ -147,7 +155,7 @@ class storageServer(object):
 
 
 	def primary_prepare_watch(self, event):
-		#my_logger.debug(" %s primary_prepare_watch called %s", self.addr, event)
+		my_logger.debug(" %s primary_prepare_watch called %s", self.addr, event)
 		try:
 			if event.type == "DELETED":
 				my_logger.debug(" %s primary_prepare_watch deleted %s", self.addr, event)
@@ -182,7 +190,7 @@ class storageServer(object):
 			else:
 				my_logger.debug("%s ??? reset watch event %s ", self.addr, event)
 				children = self.zk.get_children(event.path, watch=self.primary_prepare_watch)
-			#my_logger.debug("%s ATTENTION children here? %s ", self.addr, children)
+
 
 		except Exception, e:
 			my_logger.debug(" %s Couldn't do it: %s", self.addr, e)
@@ -207,22 +215,58 @@ class storageServer(object):
 			print task
 			return task
 
-	def kv_set_cleanup_no(self, laststage, prepare_path, commit_path):
-		a =1
-		return
+
+	def formatExceptionInfo(self, maxTBlevel=5):
+		cla, exc, trbk = sys.exc_info()
+		excName = cla.__name__
+		try:
+			excArgs = exc.__dict__["args"]
+		except KeyError:
+			excArgs = "<no args>"
+		excTb = traceback.format_tb(trbk, maxTBlevel)
+		return (excName, excArgs, excTb)
+
+
+
 
 	def kv_set_cleanup(self, laststage, prepare_path, commit_path):
-		#todo remove children that didn't succeed from uplist
+		#todo remove children that didn't succeed from uplist, this sleep here is not nice, check if we can do better
+		gevent.sleep(0.1)
 		try:
 			my_logger.debug("%s deleting commit path %s and prepare path %s ", self.addr, prepare_path, commit_path)
 			#check if this path even exists
+			#TODO THAT GOES INTO A FUNCTION
 			if not self.zk.exists(prepare_path) is None:
-				self.zk.delete(prepare_path, recursive=True)
+				children = self.zk.get_children(prepare_path)
+				for child in children:
+					self.zk.delete(prepare_path+"/"+child)
+					my_logger.debug("..............node deleted "+prepare_path)
+				try:
+					self.zk.delete(prepare_path, recursive=False)
+				except NoNodeError:
+					my_logger.debug("..............NoNodeError"+prepare_path)
+					pass
 			if not self.zk.exists(commit_path) is None:
-				self.zk.delete(commit_path, recursive=True)
+				children = self.zk.get_children(commit_path)
+				for child in children:
+					my_logger.debug("..............node deleted ")
+					self.zk.delete(commit_path+"/"+child)
+
+				try:
+					self.zk.delete(commit_path, recursive=False)
+				except NoNodeError:
+					my_logger.debug("..............NoNodeError"+commit_path)
+					pass
+
+		except KazooException, e:
+			my_logger.debug(self.formatExceptionInfo())
+			my_logger.debug("%s Couldn't do it: %s %s", self.addr, e, KazooException.message)
+			raise SystemError
+
 
 		except Exception, e:
-			my_logger.debug("%s Couldn't do it: %s", self.addr, e)
+			my_logger.debug(self.formatExceptionInfo())
+			my_logger.debug("%s Couldn't do it: %s %s", self.addr, e, Exception.message)
 			raise SystemError
 		return
 
@@ -231,11 +275,14 @@ class storageServer(object):
 
 		offset = replica_size
 		content = []
-		#fname = "operations" + addr[-1:] + ".log"
-		fname = "log5000.txt"
+		fname = self.op_log
+
+		if not os.path.isfile(fname):
+			return content
 
 		#default transfer blocks
 		transmitsize = self.file_transmitsize
+
 		fsize = os.path.getsize(fname)
 		my_logger.debug("%s syncing to %s offset %s my_size %s replica_size %s", self.addr, remote_addr, offset, fsize, replica_size)
 
@@ -281,7 +328,6 @@ class storageServer(object):
 				#todo better keep list in memory?
 				if self.zk.exists("/syncpath/"+remote_addr) is None:
 					self.zk.create("/syncpath/"+remote_addr, ephemeral=True, makepath=True)
-					my_logger.debug(">>>>>>>>>>>>>>>>>>>>>>>>>created<<<<"+"/syncpath/"+remote_addr)
 				else:
 					my_logger.debug(" %s node %s already exists?", self.addr, "/syncpath/"+remote_addr )
 
@@ -314,6 +360,10 @@ class storageServer(object):
 
 	def backup_get_oplog(self, primary_addr):
 
+		#todo check my own oplog before just deleting it
+		if os.path.isfile(self.op_log):
+			os.remove(self.op_log)
+
 		if primary_addr == self.addr:
 			my_logger.debug("%s i am primary %s", self.addr, primary_addr)
 			raise SystemError
@@ -330,15 +380,20 @@ class storageServer(object):
 		start = time.time()
 		size_received = 0
 
+
 		#todo if oplogs are logrotated, we have to get the list of files first and loop through them here
 
+		f = open(self.op_log,"a")
 		while True:
 			my_logger.debug("%s send size received to server as %s"
 				, self.addr, size_received)
-			lines_tupel = p_connection.primary_transmit_oplog(self.addr, size_received )
-			gevent.sleep(1)
 
-			if len(lines_tupel) == 0 or size_received > 1024 * 1024 * 10:
+			xstart = time.time()
+			lines_tupel = p_connection.primary_transmit_oplog(self.addr, size_received )
+			print "elapsed", time.time() - xstart
+
+			#gevent.sleep(1)
+			if len(lines_tupel) == 0:
 				# retry will give the same line again if nothing changed at the primary
 				# since we have only puts and the order of inserts is not changed, np
 				if retries < max_retries:
@@ -351,23 +406,26 @@ class storageServer(object):
 
 			for line in lines_tupel:
 				#line ="[2013-04-04 21:34:43,258] /storageserver/cx0000012585  hello13   world13 digest"
-				if False:
-					data = line[26:].rstrip()
-					tid, key, value, digest = data.split(" ")
-					m = hashlib.md5()
-					m.update(key+value)
-					if m.hexdigest() == digest:
-						#todo try catch, put in separate function?
-						self.db.Put(base64.b64decode( key ), base64.b64decode( value ))
-					else:
-						raise SystemError
-					self.op_log.write(tid+" "+key+" "+value+" "+m.hexdigest())
 
-			for line in lines_tupel:
-				if True:
-					self.op_log.write(line)
-					size_received += len(line)
-					#break
+				tid, key, value, digest = line.rstrip().split(" ")
+				md5 = hashlib.md5()
+				md5.update(key + value)
+				if md5.hexdigest() == digest:
+					#todo try catch, put in separate function?
+					dummy =1
+					self.db.Put(base64.b64decode( key ), base64.b64decode( value ))
+				else:
+					print line
+					print tid, "X"+key+"X", "X"+value+"X", "X"+digest+"X"
+					print "Y"+md5.hexdigest()+"Y"
+					raise SystemError
+
+				#TODO put that in a function!
+
+				f.write(tid+" "+key+" "+value+" "+digest+"\n")
+				#f.write(line)
+				#f.close()
+				size_received += len(line)
 
 			read_offset += self.file_transmitsize
 			#size_received = os.path.getsize("operations" + addr[-1:] + ".log")
@@ -412,10 +470,16 @@ class storageServer(object):
 
 		if self.is_primary:
 			#check if a node is syncing on syncpath
-			if not self.zk.exists("/syncpath") is None:
-				children = self.zk.get_children("/syncpath")
-				if len(children) > 0:
-					return "syncing "+children
+			try:
+				if not self.zk.exists("/syncpath") is None:
+					children = self.zk.get_children("/syncpath")
+					my_logger.debug(" %s children on syncpath %s", self.addr, str(children))
+					if len(children) > 0:
+						return "syncing "+str(children)
+
+			except Exception, e:
+				my_logger.debug(" %s Couldn't do it: %s", self.addr, e)
+				raise SystemError
 
 			lock = self.zk.Lock("/lockpath", "my-identifier")
 			with lock:
@@ -495,11 +559,16 @@ class storageServer(object):
 		if self.is_primary:
 			my_logger.debug("%s called backup on primary", self.addr)
 			raise SystemError
+
 		elif self.status != self.stati["Normal"]:
 			raise zerorpc.TimeoutExpired
 
 		else:
 			try:
+				if not self.zk.exists(prepare_path+"/ready") is None:
+					my_logger.debug("%s ready on  prepare_path already set ---------------> STALE ", self.addr)
+					return
+
 				if self.zk.exists(prepare_path) is None:
 					my_logger.debug("%s this prepare_path %s doesnt exist anymore, returning "
 						, self.addr, prepare_path + "/" + self.addr)
@@ -535,6 +604,7 @@ class storageServer(object):
 					commit_path = str(self.zk.get(prepare_path)[0])
 					data = str(self.zk.get(commit_path)[0])
 					key, value = data.split("=")
+					#TODO write log here!
 					self.db.Put(key, value)
 					self.zk.create(commit_path + "/" + self.addr)
 					my_logger.debug("%s backup commmited key %s value %s ", self.addr, key, value)
@@ -595,9 +665,14 @@ class storageServer(object):
 
 
 	def primary_register(self, op_log_size, backup_addr, remote_prio):
+
+		if not os.path.isfile(self.op_log):
+			return True
+
 		try:
 			if not  self.zk.exists("/syncpath/"+backup_addr) is None:
 				self.zk.delete("/syncpath/"+backup_addr)
+				my_logger.debug(" %s deleted syncpath for %s ", self.addr, "/syncpath/"+backup_addr)
 			else:
 				my_logger.debug(" %s where is the fking node...%s ", self.addr, "/syncpath/"+backup_addr)
 
@@ -607,13 +682,15 @@ class storageServer(object):
 
 		#todo replace check for op_log size with call to verify
 		#if op_log_size == os.path.getsize("operations" + addr[-1:] + ".log") :
-		if op_log_size == os.path.getsize("log5000.txt") :
+
+		if op_log_size == os.path.getsize(self.op_log) :
 			#todo move this into function and make it atomic?
 			self.uplist.add(remote_prio)
 			self.server_stati[backup_addr] = "up"
 			my_logger.debug(" %s added remote prio %s to uplist, uplist now %s "
 				, self.addr, remote_prio, str(self.uplist))
 			return True
+
 		my_logger.debug(" %s size does not match oplogsize %s path size %s "
 				, self.addr, op_log_size, os.path.getsize("log5000.txt") )
 
@@ -629,6 +706,8 @@ class storageServer(object):
 				todo = 1
 				#TODO update status to up only after we checked
 				#get oplog first and sync!
+
+
 				self.backup_get_oplog(primary_addr)
 			#registered
 			#self.backup_register( primary_addr )
@@ -654,6 +733,9 @@ class storageServer(object):
 
 
 if __name__ == '__main__':
+	logger = logging.getLogger('spam_application')
+	logger.setLevel(logging.DEBUG)
+
 	addr = sys.argv[1]
 	my_logger = logging.getLogger("storagelogger")
 	my_logger.setLevel(logging.DEBUG)
