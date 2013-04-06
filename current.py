@@ -52,8 +52,6 @@ class storageServer(object):
 		self.server_stati = {}
 		self.uplist = set()
 
-
-
 		self.stati = {"Down": 0, "Election": 1, "Reorganisation": 2, "Normal": 3}
 		self.t_stati = {"Ready": 0, "Commited": 2, "Rolledback": 3}
 		self.status = self.stati["Down"]
@@ -116,6 +114,7 @@ class storageServer(object):
 					self.commited[event.path] =1
 					my_logger.debug("%s commit successfull children %s", self.addr, len(children))
 					commit_path = str(event.path)
+					#TODO please put me into a function!
 					data = str(self.zk.get(commit_path)[0])
 					key, value = data.split("=")
 					key_enc = base64.b64encode( key )
@@ -230,6 +229,8 @@ class storageServer(object):
 
 
 	def kv_set_cleanup(self, laststage, prepare_path, commit_path):
+		if True:
+			return
 		#todo remove children that didn't succeed from uplist, this sleep here is not nice, check if we can do better
 		gevent.sleep(0.1)
 		try:
@@ -606,6 +607,16 @@ class storageServer(object):
 					key, value = data.split("=")
 					#TODO write log here!
 					self.db.Put(key, value)
+
+					#write log here
+					key_enc = base64.b64encode( key )
+					value_enc = base64.b64encode( value )
+					m = hashlib.md5()
+					m.update(key_enc  +value_enc)
+					f = open(self.op_log,"a")
+					f.write(commit_path+" "+key_enc+" "+value_enc+" "+m.hexdigest()+"\n")
+					f.close()
+
 					self.zk.create(commit_path + "/" + self.addr)
 					my_logger.debug("%s backup commmited key %s value %s ", self.addr, key, value)
 

@@ -8,6 +8,17 @@
 - encode values in a better way
 - use logrotation and compression!
 
+
+tests:
+	run 100 client requests,
+	make sure everybody has same log file size
+	check kazzoo connection, deal witch suspend and lost - how?
+
+
+
+make sure client 1 does not accept prep_requests after 1000 requests
+bring client back after number of requests
+
 deal with lockfiles!
 ./db0/LOCK
 - does client need to contain a database?
@@ -20,6 +31,12 @@ if i am first child i have to be primary!
 
 testcase:
 	primary alone, deny, add a backup, accept
+
+check master failure
+
+clear database if child!
+
+do selftest logfile == consecutive logids, key, value checksum
 
 
 check different use cases:
