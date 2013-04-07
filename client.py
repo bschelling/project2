@@ -20,6 +20,8 @@ class storageClient(object):
 		f = open(config_file, 'r')
 		i = 0
 		for line in f.readlines():
+			if line.startswith("#"):
+				continue
 			line = line.rstrip()
 			connection = zerorpc.Client(timeout=10)
 			connection.connect('tcp://' + line)

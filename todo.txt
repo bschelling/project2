@@ -9,12 +9,14 @@
 - use logrotation and compression!
 
 
+catch nonode errors in getchildren
+
+
 tests:
 	run 100 client requests,
 	make sure everybody has same log file size
 	check kazzoo connection, deal witch suspend and lost - how?
-
-
+	set status to down if commit failed!
 
 make sure client 1 does not accept prep_requests after 1000 requests
 bring client back after number of requests
