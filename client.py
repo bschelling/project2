@@ -79,7 +79,7 @@ class storageClient(object):
 			try:
 				#todo read key value from a file
 				print "sending request to server", server.addr
-				result = server.connection.kv_set("hello"+str(i),"world"+str(i),self.addr)
+				result = server.connection.kv_set("hello"+str(i),"world"+str(i)+str(time.time()) ,self.addr)
 				print i, server.addr, result
 				if result !="commited":
 					time.sleep(1)

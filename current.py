@@ -84,6 +84,16 @@ class storageServer(object):
 		my_logger.debug("%s self.is_primary %s", self.addr, self.is_primary)
 
 
+	def write_data(self,commit_path, key, value):
+		key_enc = base64.b64encode( key )
+		value_enc = base64.b64encode( value )
+		m = hashlib.md5()
+		m.update(key_enc  +value_enc)
+		f = open(self.op_log,"a")
+		f.write(commit_path+" "+key_enc+" "+value_enc+" "+m.hexdigest()+"\n")
+		f.close()
+
+
 	def primary_commit_watch(self, event):
 		try:
 			try:
@@ -96,20 +106,13 @@ class storageServer(object):
 
 			elif event.type == "CHILD":
 				if len(children) >= self.quorum_size:
-					self.commited[event.path] =1
 					my_logger.debug("%s commit successfull children %s", self.addr, len(children))
 					commit_path = str(event.path)
-					#TODO please put me into a function!
 					data = str(self.zk.get(commit_path)[0])
 					key, value = data.split("=")
-					key_enc = base64.b64encode( key )
-					value_enc = base64.b64encode( value )
-					m = hashlib.md5()
-					m.update(key_enc  +value_enc)
-					f = open(self.op_log,"a")
-					f.write(commit_path+" "+key_enc+" "+value_enc+" "+m.hexdigest()+"\n")
-					f.close()
+					self.write_data(commit_path, key, value)
 					self.tasks.put("commited")
+					self.commited[event.path] =1
 
 			else:
 				children = self.zk.get_children(event.path, watch=self.primary_commit_watch)
@@ -122,6 +125,37 @@ class storageServer(object):
 			my_logger.debug(" %s Couldn't do it: %s", self.addr, e)
 			raise SystemError
 
+	def oplog_sanity_check(self):
+		#called on restart of a note, check if my oplog file is sane
+		f = open(self.op_log)
+		is_sane_op_log = True
+
+		for line in f:
+			try:
+				tid, key, value, digest = line.rstrip().split(" ")
+			except ValueError:
+				logging.debug(line)
+				op_log_sanity = False
+				raise SystemError
+				break
+
+			md5 = hashlib.md5()
+			md5.update(key + value)
+			if md5.hexdigest() == digest:
+				continue
+			else:
+				logging.debug(line)
+				op_log_sanity = False
+				raise SystemError
+				break
+
+
+		f.close()
+		if is_sane_op_log:
+			return os.path.getsize(self.op_log)
+		else:
+			#todo empty local database
+			return 0
 
 	def primary_prepare_watch(self, event):
 		my_logger.debug(" %s primary_prepare_watch called %s", self.addr, event)
@@ -266,11 +300,16 @@ class storageServer(object):
 				return server.connection
 		raise SystemError
 
+
+
 	def backup_get_oplog(self, primary_addr):
 
-		#todo check my own oplog before just deleting it
+		#check if operationlog is sane or has to be retransmitted
+		size_received = 0
 		if os.path.isfile(self.op_log):
-			os.remove(self.op_log)
+			size_received = self.oplog_sanity_check()
+			if size_received == 0:
+				os.remove(self.op_log)
 
 		if primary_addr == self.addr:
 			my_logger.debug("%s i am primary %s", self.addr, primary_addr)
@@ -282,12 +321,11 @@ class storageServer(object):
 		p_connection = zerorpc.Client(timeout=30)
 		p_connection.connect('tcp://' + primary_addr)
 		retries = 0
-		max_retries = 1
-		read_offset = 0
+		max_retries = 2
 		start = time.time()
-		size_received = 0
 		failcount = 0
 		max_failcount = 1
+		read_offset = 0
 
 		f = open(self.op_log,"a")
 		while True:
@@ -306,7 +344,12 @@ class storageServer(object):
 					break
 
 			for line in lines_tupel:
-				tid, key, value, digest = line.rstrip().split(" ")
+				try:
+					tid, key, value, digest = line.rstrip().split(" ")
+				except ValueError:
+					print line
+					raise SystemError
+
 				md5 = hashlib.md5()
 				md5.update(key + value)
 				if md5.hexdigest() == digest:
@@ -320,7 +363,6 @@ class storageServer(object):
 					else:
 						raise SystemError
 
-				#TODO put that in a function!
 				f.write(tid+" "+key+" "+value+" "+digest+"\n")
 				size_received += len(line)
 
@@ -470,24 +512,14 @@ class storageServer(object):
 				my_logger.debug("%s called backup on primary", self.addr)
 				raise SystemError
 			else:
+
 				if event.type == "CREATED":
 					ready_path = str(event.path)
 					prepare_path = ready_path[0:ready_path.rfind("/")]
 					commit_path = str(self.zk.get(prepare_path)[0])
 					data = str(self.zk.get(commit_path)[0])
 					key, value = data.split("=")
-					#TODO write log here!
-
-					self.db.Put(key, value)
-					#write log here
-					key_enc = base64.b64encode( key )
-					value_enc = base64.b64encode( value )
-					m = hashlib.md5()
-					m.update(key_enc  +value_enc)
-					f = open(self.op_log,"a")
-					f.write(commit_path+" "+key_enc+" "+value_enc+" "+m.hexdigest()+"\n")
-					f.close()
-
+					self.write_data(commit_path, key, value)
 					#if we already commited theres no need to create
 					self.zk.create(commit_path + "/" + self.addr)
 					my_logger.debug("%s backup commmited key %s value %s ", self.addr, key, value)
@@ -501,28 +533,35 @@ class storageServer(object):
 
 		if not os.path.isfile(self.op_log):
 			return True
+
 		try:
-			if not  self.zk.exists("/syncpath/"+backup_addr) is None:
-				self.zk.delete("/syncpath/"+backup_addr)
-				my_logger.debug(" %s deleted syncpath for %s ", self.addr, "/syncpath/"+backup_addr)
+
+			if op_log_size == os.path.getsize(self.op_log) :
+				self.uplist.add(remote_prio)
+				self.server_stati[backup_addr] = "up"
+				my_logger.debug(" %s added remote prio %s to uplist, uplist now %s "
+					, self.addr, remote_prio, str(self.uplist))
+
+				if not self.zk.exists("/syncpath/"+backup_addr) is None:
+					self.zk.delete("/syncpath/"+backup_addr)
+					my_logger.debug(" %s deleted syncpath for %s ", self.addr, "/syncpath/"+backup_addr)
+				else:
+					my_logger.debug(" %s node missing %s ", self.addr, "/syncpath/"+backup_addr)
+					raise SystemError
+
 			else:
-				my_logger.debug(" %s where is the fking node...%s ", self.addr, "/syncpath/"+backup_addr)
+				my_logger.debug(" %s client oplogsize %s does not match my op_log_size  %s "
+					, self.addr, op_log_size, os.path.getsize(self.op_log) )
+				#force backup to retry!
+				return False
+
+			return True
 
 		except Exception, e:
 			my_logger.debug(" %s Couldn't do it: %s", self.addr, e)
 			raise SystemError
 
-		if op_log_size == os.path.getsize(self.op_log) :
-			#todo move this into function and make it atomic?
-			self.uplist.add(remote_prio)
-			self.server_stati[backup_addr] = "up"
-			my_logger.debug(" %s added remote prio %s to uplist, uplist now %s "
-				, self.addr, remote_prio, str(self.uplist))
-			return True
-		else:
-			my_logger.debug(" %s size does not match oplogsize %s path size %s "
-				, self.addr, op_log_size, os.path.getsize("log5000.txt") )
-			return False
+
 
 	def get_primary_addr(self):
 
