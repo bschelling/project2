@@ -9,10 +9,15 @@ import gevent
 import zerorpc
 import collections
 import os
+from kazoo.client import KazooState
+from kazoo.exceptions import *
+
 
 class storageClient(object):
 
 	def __init__(self, max, config_file='server_config'):
+
+		self.election_path_prefix ="/MYLEADERELECTION/"
 		self.addr = "127.0.0.1:9000"
 		self.max = max
 		self.servers = []
@@ -28,22 +33,63 @@ class storageClient(object):
 			#todo to we need an uplist here?
 			self.servers.append(ntconnection(line,connection,i,"up"))
 
-	def start(self):
-		max = self.max + 1
+		self.zk = KazooClient(timeout =1)
+		self.zk.start()
+
+	def connection_listener(self, state):
+		if state == KazooState.LOST:
+			my_logger.debug('%s : session lost', self.addr)
+		elif state == KazooState.SUSPENDED:
+			my_logger.debug('%s : session suspended', self.addr)
+		else:
+			my_logger.debug('%s : running in state %s', self.addr, state)
+
+
+	def get_sorted_children(self):
+		#check if children really exist
+		children = self.zk.get_children(self.election_path_prefix)
+		# can't just sort directly: the node names are prefixed by uuids
+		children.sort(key=lambda c: c[c.find("guid_n") + len("guid_n"):])
+		return children
+
+	def get_primary_addr(self):
+		primary_path = self.get_sorted_children()[0]
+		primary_addr = str(self.zk.get(self.election_path_prefix + primary_path)[0])
+		return primary_addr
+
+	def get_server_by_addr(self, addr):
 		for server in self.servers:
+			if server.addr == addr :
+				return server
+		raise SystemError
 
-			if server.addr == "127.0.0.1:9001":
-				a = time.time()
-				for i in range(1,max):
-					result = server.connection.kv_set("hello"+str(i),"world"+str(i),self.addr)
-					print i, server.addr, result
-					if result !="commited":
-						dummy = 1
-						#time.sleep(1)
-						#break
-				print i, "requests sent", time.time() - a
-				break
 
+	def start(self):
+
+		if self.zk.exists(self.election_path_prefix) is None:
+			print "no election path found quitting"
+		primary_addr = self.get_primary_addr()
+		a = time.time()
+
+		max = self.max + 1
+		print "my max is " + str(max)
+
+		for i in range(1 , max):
+			server = self.get_server_by_addr(primary_addr)
+			try:
+				#todo read key value from a file
+				print "sending request to server", server.addr
+				result = server.connection.kv_set("hello"+str(i),"world"+str(i),self.addr)
+				print i, server.addr, result
+				if result !="commited":
+					time.sleep(1)
+
+			except zerorpc.TimeoutExpired:
+				time.sleep(2)
+				primary_addr = self.get_primary_addr()
+				print "changed primary addr ", primary_addr
+
+			print i, "requests sent", time.time() - a
 
 		print "ok counting operations"
 		num_lines = sum(1 for line in open('operations1.log'))

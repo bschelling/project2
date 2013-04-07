@@ -31,12 +31,15 @@ class storageServer(object):
 		self.election_path_prefix ="/MYLEADERELECTION/"
 		self.storage_prefix = "/storageserver/tx"
 		self.commit_prefix = "/storageserver/cx"
+		self.is_primary = False
+		self.primary_path = ""
+		self.primary_addr = ""
 
 		self.file_transmitsize = 1024 * 1024  #bytes offset
 		self.quorum_size = 1
 		self.addr = addr
 		self.i = 0
-		self.is_primary = False
+
 		self.servers = []
 		self.server_stati = {}
 		self.uplist = set()
@@ -55,7 +58,7 @@ class storageServer(object):
 				self.i = i
 				connection = self
 			else:
-				connection = zerorpc.Client(timeout=1)
+				connection = zerorpc.Client(timeout=1,heartbeat=1)
 				connection.connect('tcp://' + line)
 				my_logger.debug("%s server %s added as up!", self.addr, line)
 				self.server_stati[line] = "up"
@@ -74,7 +77,7 @@ class storageServer(object):
 
 
 	def start(self):
-		self.zk = KazooClient()
+		self.zk = KazooClient(timeout=1)
 		self.zk.start()
 		self.status = self.stati["Normal"]
 		self.start_election()
@@ -145,7 +148,7 @@ class storageServer(object):
 		task = ""
 		try:
 			while True:
-				task = self.tasks.get(timeout=1) # decrements queue size by 1
+				task = self.tasks.get(timeout=2) # decrements queue size by 1
 				my_logger.debug(" %s got task %s", self.addr, task)
 				gevent.sleep(0)
 				if task == "commited" or task == "failed":
@@ -522,6 +525,7 @@ class storageServer(object):
 			return False
 
 	def get_primary_addr(self):
+
 		if self.is_primary:
 			return self.addr
 
@@ -532,10 +536,12 @@ class storageServer(object):
 
 		primary_path = self.get_sorted_children()[0]
 		primary_addr = str(self.zk.get(self.election_path_prefix + primary_path)[0])
+		my_logger.debug("%s i am not primary", self.addr)
 		return primary_addr
 
 	####################################election  functions ################################
 	def connection_listener(self, state):
+		#todo got to election!
 		if state == KazooState.LOST:
 			my_logger.debug('%s : session lost', self.addr)
 		elif state == KazooState.SUSPENDED:
@@ -545,8 +551,10 @@ class storageServer(object):
 
 
 	def get_sorted_children(self):
+
 		children = self.zk.get_children(self.election_path_prefix)
-		# can't just sort directly: the node names are prefixed by uuids
+		# can't just sort directly:
+		# sort the children by logfilesize nodename format is s[oplogsize]_sequencenumber
 		children.sort(key=lambda c: c[c.find("guid_n") + len("guid_n"):])
 		return children
 
@@ -554,24 +562,26 @@ class storageServer(object):
 
 		prev_path = None
 		primary_path = None
-		children = self.get_sorted_children()
-		primary_path = children[0]
-		my_logger.debug("%s sorted children is %s", self.addr, children)
-		if primary_path == self.election_path:
-			return prev_path, self.election_path
+		sorted_children = self.get_sorted_children()
+		primary_path = sorted_children[0]
+		my_logger.debug("%s sorted children is %s", self.addr, sorted_children)
+		my_path = self.election_path.replace(self.election_path_prefix, "")
+		if primary_path == my_path:
+			return None, self.election_path
+
 		else:
-			for child_path in sorted(children):
-				if child_path == self.election_path:
+			for child_path in sorted_children:
+				if child_path == my_path:
 					break
 				else:
 					prev_path = child_path
 
-		return  prev_path, self.election_path_prefix+str(primary_path)
+		return  str(self.election_path_prefix + prev_path), str(self.election_path_prefix+primary_path)
 
-
+	#todo since we have to reset the watch every time check if not better use children watch!
 	def watch_node(self, prev_path):
-		print "setting watch on ",self.election_path_prefix + prev_path
-		@self.zk.DataWatch(self.election_path_prefix + prev_path)
+		print "setting watch on ", prev_path
+		@self.zk.DataWatch( prev_path)
 		def watch_node(data, stat):
 			try:
 				if data is None and stat is None:
@@ -580,63 +590,108 @@ class storageServer(object):
 						my_logger.debug("%s prev_path deleted prev_path %s primary_path %s"
 							,self.addr, prev_path, primary_path)
 						self.set_primary(True, primary_path)
+						return
 
-					else:
-						if self.zk.exists(primary_path):
-							if self.zk.get(primary_path)[0] != self.addr:
-								my_logger.debug("%s %s deleted but still not addmin, my_path %s prev_path %s "
-									, self.addr,self.zk.get(primary_path)[0], self.election_path, prev_path)
-								self.watch_node( prev_path)
-							else:
-								my_logger.debug("%s ok lets wait node with our address still there %s"
-									, self.addr, self.zk.get(primary_path)[0])
-								gevent.sleep(1)
+					if not self.zk.exists(primary_path) is None:
+						if self.zk.get(primary_path)[0] != self.addr:
+							my_logger.debug("%s %s deleted but still not addmin, my_path %s prev_path %s "
+								, self.addr,self.zk.get(primary_path)[0], self.election_path, prev_path)
 						else:
-							my_logger.debug("%s primary path %s does not exisit anymore ", self.addr, primary_path)
+							my_logger.debug("%s ok lets wait node with our address still there %s"
+								, self.addr, self.zk.get(primary_path)[0])
+					else:
+						my_logger.debug("%s primary path %s does not exisit anymore ", self.addr, primary_path)
+
+					my_logger.debug("%s resetting watch to prev_path %s ", self.addr, prev_path)
+					self.watch_node(prev_path)
 
 			except Exception, e:
 				my_logger.debug(" %s Couldn't do it: %s", self.addr, str(self.formatExceptionInfo(Exception)))
 				raise SystemError
 
 	def set_primary(self, is_primary, primary_path):
+
+		my_logger.debug(">>>>>>>>>>>>>>>>>>>>>>>>set<<<<<<<<<<<<<<<<<<")
 		my_logger.debug("%s PRIMARY  %s set from %s", self.addr, is_primary, inspect.stack()[1][3])
-		self.is_primary = is_primary
+		my_logger.debug("%s self.election_path is %s", self.addr, self.election_path)
+		my_logger.debug("%s sorted children is %s", self.addr, self.get_sorted_children())
+
+		if self.primary_path == primary_path:
+			my_logger.debug("%s already got path %s as primary_path, ignored ", self.addr, primary_path)
+			return
+		else:
+			my_logger.debug("%s setting my primary to %s with path %s ",self.addr, is_primary, primary_path)
+			self.is_primary = is_primary
+			self.primary_path = primary_path
 
 		if not is_primary:
-			if self.zk.exists( primary_path ):
+			if not self.zk.exists( primary_path ) is None:
 				primary_addr = str(self.zk.get(primary_path)[0])
+				#stale primary with same address after node restart, ignore
+				if primary_addr == self.addr:
+					my_logger.debug("%s primary_addr %s same as mine, ignored ",self.addr, primary_addr)
+					return
+
+				#check if primary knows he's primary
 				primary_conn = self.get_connection_by_addr(addr)
 				try:
 					r_primary_addr = primary_conn.get_primary_addr()
 					my_logger.debug("%s primary_addr %s confirmed primary is %s",self.addr, primary_addr, r_primary_addr )
 				except zerorpc.TimeoutExpired:
+					#primary not reachable or already new election running, wait
+					my_logger.debug("%s primary_addr %s not reachable, timeout ",self.addr, primary_addr )
 					return
 				if r_primary_addr == primary_addr and r_primary_addr != self.addr:
-					self.backup_get_oplog(str(self.zk.get(primary_path)[0]))
+						my_logger.debug("%s primary_addr %s confirmed getting oplog now!",self.addr, primary_addr)
+						self.backup_get_oplog(r_primary_addr)
+
+			else:
+				my_logger.debug("%s primary path %s does not exist ",self.addr, primary_path)
 
 		else:
 			for server in self.servers:
 				if server.addr != self.addr:
 					try:
 						print "setting primary on ", server.addr
+						#todo check if they accept!
 						server.connection.set_primary(False, self.election_path)
 					except zerorpc.TimeoutExpired:
-						return
+						print "timeout setting primary on ", server.addr
 
 	def start_election(self):
+		'''
+
+		 Election is performed on zookeeper. Each node creates a path on zookeeper
+		 the first node on the path wins the election.
+
+		 Each node keeps a watch on its predecessor. Notified about a change it will check if
+		 its the first node on the path. The new Primary has to notify each replica. The primary
+		 will not do any communication with the replica until it has completely synchronised its
+		 operation log.
+
+		 On notification Replicas will start to sync their operation log with the new primary.
+		 After successfull synchronisation the replica will register with the primary and take
+		 part in the backup process.
+
+		'''
+
 		self.zk.add_listener(self.connection_listener)
 		if self.zk.exists(self.election_path_prefix) is None:
 			self.zk.ensure_path(self.election_path_prefix)
 
-		my_path = self.zk.create(self.election_path_prefix+"guid_n", self.addr, ephemeral=True, sequence=True)
-		self.election_path = my_path.replace(self.election_path_prefix, "")
-		my_logger.debug("%s my path is %s", self.addr, self.election_path)
+		self.election_path = self.zk.create(self.election_path_prefix + "guid_n"
+			, self.addr, ephemeral=True, sequence=True
+		)
 
+		my_logger.debug("%s my path is %s", self.addr, self.election_path)
 		prev_path, primary_path = self.get_prev_path()
-		if not prev_path is None:
-			self.set_primary(False, primary_path)
+
+		if  prev_path is None:
+			self.set_primary(True, primary_path)
 		else:
-			self.set_primary(True,"")
+			self.watch_node(prev_path)
+			self.set_primary(False, primary_path)
+
 
 if __name__ == '__main__':
 	logger = logging.getLogger('spam_application')
