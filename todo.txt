@@ -13,6 +13,7 @@ catch nonode errors in getchildren
 
 
 tests:
+	assure that biggest logfile wins!
 	run 100 client requests,
 	make sure everybody has same log file size
 	check kazzoo connection, deal witch suspend and lost - how?

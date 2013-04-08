@@ -37,6 +37,7 @@ class storageClient(object):
 		self.zk.start()
 
 	def connection_listener(self, state):
+
 		if state == KazooState.LOST:
 			my_logger.debug('%s : session lost', self.addr)
 		elif state == KazooState.SUSPENDED:
@@ -45,14 +46,15 @@ class storageClient(object):
 			my_logger.debug('%s : running in state %s', self.addr, state)
 
 
-	def get_sorted_children_old(self):
+	def get_sorted_children(self):
 		#check if children really exist
 		children = self.zk.get_children(self.election_path_prefix)
 		# can't just sort directly: the node names are prefixed by uuids
 		children.sort(key=lambda c: c[c.find("guid_n") + len("guid_n"):])
 		return children
 
-	def get_sorted_children(self):
+	#TODO CAN'T TRUST THIS
+	def get_sorted_children_size(self):
 
 		children = self.zk.get_children(self.election_path_prefix)
 		oplog_sizes = {}
@@ -94,8 +96,8 @@ class storageClient(object):
 			server = self.get_server_by_addr(primary_addr)
 			try:
 				put_result = server.connection.kv_set("hello"+str(i),"world"+str(i)+"_"+str(time.time()) ,self.addr)
-				get_result = server.connection.kv_get("hello"+str(i) ,self.addr)
-				print put_result, get_result
+				#get_result = server.connection.kv_get("hello"+str(i) ,self.addr)
+				print put_result
 				status = put_result[0]
 				message = put_result[1]
 				if status == 400:
