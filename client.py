@@ -45,12 +45,29 @@ class storageClient(object):
 			my_logger.debug('%s : running in state %s', self.addr, state)
 
 
-	def get_sorted_children(self):
+	def get_sorted_children_old(self):
 		#check if children really exist
 		children = self.zk.get_children(self.election_path_prefix)
 		# can't just sort directly: the node names are prefixed by uuids
 		children.sort(key=lambda c: c[c.find("guid_n") + len("guid_n"):])
 		return children
+
+	def get_sorted_children(self):
+
+		children = self.zk.get_children(self.election_path_prefix)
+		oplog_sizes = {}
+
+		for child in children:
+			addr = self.zk.get(self.election_path_prefix+child)[0]
+			fsize = 0
+			oplog ="operations"+str(addr[-1:])+".log"
+			if os.path.isfile(oplog):
+				fsize = os.path.getsize(oplog)
+			oplog_sizes[child] =  fsize
+
+		children = sorted(children, key=oplog_sizes.__getitem__, reverse=True)
+		return children
+
 
 	def get_primary_addr(self):
 		primary_path = self.get_sorted_children()[0]
@@ -63,25 +80,30 @@ class storageClient(object):
 				return server
 		raise SystemError
 
-
 	def start(self):
-
 		if self.zk.exists(self.election_path_prefix) is None:
 			print "no election path found quitting"
 		primary_addr = self.get_primary_addr()
 		a = time.time()
-
 		max = self.max + 1
 		print "my max is " + str(max)
 
+
+		failcount = 0
 		for i in range(1 , max):
 			server = self.get_server_by_addr(primary_addr)
 			try:
-				#todo read key value from a file
-				print "sending request to server", server.addr
-				result = server.connection.kv_set("hello"+str(i),"world"+str(i)+str(time.time()) ,self.addr)
-				print i, server.addr, result
-				if result !="commited":
+				put_result = server.connection.kv_set("hello"+str(i),"world"+str(i)+"_"+str(time.time()) ,self.addr)
+				get_result = server.connection.kv_get("hello"+str(i) ,self.addr)
+				print put_result, get_result
+				status = put_result[0]
+				message = put_result[1]
+				if status == 400:
+					failcount +=1
+					primary_addr = self.get_primary_addr()
+					print "new primary", primary_addr
+					time.sleep(1)
+				elif status == 500:
 					time.sleep(1)
 
 			except zerorpc.TimeoutExpired:

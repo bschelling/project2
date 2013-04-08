@@ -29,8 +29,11 @@ class storageServer(object):
 
 		self.op_log = "operations"+addr[-1:]+".log"
 		self.election_path_prefix ="/MYLEADERELECTION/"
+		self.election_path_counter="/MYLEADERELECTION_COUNT/"
+		self.election_id = 0
 		self.storage_prefix = "/storageserver/tx"
 		self.commit_prefix = "/storageserver/cx"
+
 		self.is_primary = False
 		self.primary_path = ""
 		self.primary_addr = ""
@@ -126,10 +129,15 @@ class storageServer(object):
 			raise SystemError
 
 	def oplog_sanity_check(self):
+		return 0
+
+	def oplog_sanity_check_todo(self):
 		#called on restart of a note, check if my oplog file is sane
+		# todo check if start of oplog is the as server has
 		f = open(self.op_log)
 		is_sane_op_log = True
 
+		#todo check for ascending transaction sequence
 		for line in f:
 			try:
 				tid, key, value, digest = line.rstrip().split(" ")
@@ -149,7 +157,6 @@ class storageServer(object):
 				raise SystemError
 				break
 
-
 		f.close()
 		if is_sane_op_log:
 			return os.path.getsize(self.op_log)
@@ -158,7 +165,7 @@ class storageServer(object):
 			return 0
 
 	def primary_prepare_watch(self, event):
-		my_logger.debug(" %s primary_prepare_watch called %s", self.addr, event)
+		#my_logger.debug(" %s primary_prepare_watch called %s", self.addr, event)
 		try:
 			if event.type == "DELETED":
 				return
@@ -183,7 +190,7 @@ class storageServer(object):
 		try:
 			while True:
 				task = self.tasks.get(timeout=2) # decrements queue size by 1
-				my_logger.debug(" %s got task %s", self.addr, task)
+				#my_logger.debug(" %s got task %s", self.addr, task)
 				gevent.sleep(0)
 				if task == "commited" or task == "failed":
 					break
@@ -204,7 +211,7 @@ class storageServer(object):
 
 
 	def get_prio_by_addr(self,addr):
-		my_logger.debug("%s got addr %s ", self.addr,addr)
+		#my_logger.debug("%s got addr %s ", self.addr,addr)
 		i = -1
 		for i, server in enumerate(self.servers):
 			if server.addr == addr:
@@ -224,12 +231,12 @@ class storageServer(object):
 				self.zk.delete(path+"/"+child)
 
 			self.uplist = sucessfull_childs
-			my_logger.debug("%s deleting path %s uplist now is %s ", self.addr, path, self.uplist)
+			#my_logger.debug("%s deleting path %s uplist now is %s ", self.addr, path, self.uplist)
 			self.zk.delete(path, recursive=False)
 
 		except Exception, e:
 			my_logger.debug(self.formatExceptionInfo())
-			my_logger.debug("%s Couldn't do it: %s %s", self.addr, e, KazooException.message)
+			#my_logger.debug("%s Couldn't do it: %s %s", self.addr, e, KazooException.message)
 			raise SystemError
 
 	def primary_cleanup(self, prepare_path, commit_path):
@@ -300,12 +307,11 @@ class storageServer(object):
 				return server.connection
 		raise SystemError
 
-
-
 	def backup_get_oplog(self, primary_addr):
 
 		#check if operationlog is sane or has to be retransmitted
 		size_received = 0
+		#todo first value has to be the same in both files
 		if os.path.isfile(self.op_log):
 			size_received = self.oplog_sanity_check()
 			if size_received == 0:
@@ -339,6 +345,7 @@ class storageServer(object):
 			if len(lines_tupel) == 0:
 				if retries < max_retries:
 					retries += 1
+					gevent.sleep(1)
 					continue
 				else:
 					break
@@ -346,7 +353,9 @@ class storageServer(object):
 			for line in lines_tupel:
 				try:
 					tid, key, value, digest = line.rstrip().split(" ")
+
 				except ValueError:
+					open("debugx.txt","w").write(str(lines_tupel))
 					print line
 					raise SystemError
 
@@ -384,6 +393,12 @@ class storageServer(object):
 			my_logger.debug("%s getting oplog failed, couldn't catch up %s", self.addr, primary_addr)
 
 
+	def kv_get(self, key, remote_addr):
+		lock = self.zk.Lock("/lockpath", "my-identifier")
+		with lock:
+			val = self.db.Get(key)
+			lock.release()
+		return val
 
 	def kv_set(self, key, value, remote_addr):
 
@@ -392,7 +407,7 @@ class storageServer(object):
 			try:
 				if not self.zk.exists("/syncpath") is None:
 					children = self.zk.get_children("/syncpath")
-					my_logger.debug(" %s children on syncpath %s", self.addr, str(children))
+					#my_logger.debug(" %s children on syncpath %s", self.addr, str(children))
 					if len(children) > 0:
 						return "syncing "+str(children)
 
@@ -407,7 +422,7 @@ class storageServer(object):
 				if self.status != self.stati["Normal"]:
 					return 0
 
-				my_logger.debug(" %s started handling request from  %s", self.addr, remote_addr)
+				#my_logger.debug(" %s started handling request from  %s", self.addr, remote_addr)
 				self.g_status_handler = gevent.Greenlet(self.status_handler)
 				self.g_status_handler.start()
 
@@ -447,12 +462,17 @@ class storageServer(object):
 				my_logger.debug("%s result received %s", self.addr, self.g_status_handler.value)
 
 			lock.release()
+			status = 500
+			if self.g_status_handler.value == "commited":
+				status = 200
+
 			gevent.spawn_later(2, self.primary_cleanup, prepare_path, commit_path)
-			return self.g_status_handler.value
+			return (status, self.g_status_handler.value)
 
 		else:
 			my_logger.debug("%s sorry not primary", self.addr)
-			return 0
+			status = 400
+			return (status, self.get_primary_addr())
 
 	def primary_prepare(self, prepare_path, commit_path, key, value):
 		prepare_acks = 0
@@ -492,8 +512,8 @@ class storageServer(object):
 
 				# create and trigger primary_prepare_watch
 				# check we coul have gotten an old message here, check if the prepare path still exists!
-				my_logger.debug("%s creating prepare node  adding exists watcher to%s ", self.addr,
-					prepare_path + "/" + self.addr)
+				#my_logger.debug("%s creating prepare node  adding exists watcher to%s ", self.addr,
+				#	prepare_path + "/" + self.addr)
 
 				self.zk.exists(prepare_path + "/ready", watch=self.backup_kv_commit_watcher)
 				path = self.zk.create(prepare_path + "/" + self.addr, self.addr, acl=None, ephemeral=True,
@@ -583,18 +603,31 @@ class storageServer(object):
 		#todo got to election!
 		if state == KazooState.LOST:
 			my_logger.debug('%s : session lost', self.addr)
+			self.status = self.stati["down"]
+
 		elif state == KazooState.SUSPENDED:
 			my_logger.debug('%s : session suspended', self.addr)
+			self.status = self.stati["down"]
+
 		else:
+
 			my_logger.debug('%s : running in state %s', self.addr, state)
 
 
 	def get_sorted_children(self):
 
 		children = self.zk.get_children(self.election_path_prefix)
-		# can't just sort directly:
-		# sort the children by logfilesize nodename format is s[oplogsize]_sequencenumber
-		children.sort(key=lambda c: c[c.find("guid_n") + len("guid_n"):])
+		oplog_sizes = {}
+
+		for child in children:
+			addr = self.zk.get(self.election_path_prefix+child)[0]
+			fsize = 0
+			oplog ="operations"+str(addr[-1:])+".log"
+			if os.path.isfile(oplog):
+				fsize = os.path.getsize(oplog)
+			oplog_sizes[child] =  fsize
+
+		children = sorted(children, key=oplog_sizes.__getitem__, reverse=True)
 		return children
 
 	def get_prev_path(self):
@@ -603,7 +636,6 @@ class storageServer(object):
 		primary_path = None
 		sorted_children = self.get_sorted_children()
 		primary_path = sorted_children[0]
-		my_logger.debug("%s sorted children is %s", self.addr, sorted_children)
 		my_path = self.election_path.replace(self.election_path_prefix, "")
 		if primary_path == my_path:
 			return None, self.election_path
@@ -617,9 +649,8 @@ class storageServer(object):
 
 		return  str(self.election_path_prefix + prev_path), str(self.election_path_prefix+primary_path)
 
-	#todo since we have to reset the watch every time check if not better use children watch!
+
 	def watch_node(self, prev_path):
-		print "setting watch on ", prev_path
 		@self.zk.DataWatch( prev_path)
 		def watch_node(data, stat):
 			try:
@@ -628,7 +659,8 @@ class storageServer(object):
 					if prev_path is None:
 						my_logger.debug("%s prev_path deleted prev_path %s primary_path %s"
 							,self.addr, prev_path, primary_path)
-						self.set_primary(True, primary_path)
+						self.election_id = self.increment_election_id()
+						self.set_primary(True, primary_path, self.election_id)
 						return
 
 					if not self.zk.exists(primary_path) is None:
@@ -648,16 +680,17 @@ class storageServer(object):
 				my_logger.debug(" %s Couldn't do it: %s", self.addr, str(self.formatExceptionInfo(Exception)))
 				raise SystemError
 
-	def set_primary(self, is_primary, primary_path):
+	def set_primary(self, is_primary, primary_path, election_id):
 
-		my_logger.debug(">>>>>>>>>>>>>>>>>>>>>>>>set<<<<<<<<<<<<<<<<<<")
-		my_logger.debug("%s PRIMARY  %s set from %s", self.addr, is_primary, inspect.stack()[1][3])
-		my_logger.debug("%s self.election_path is %s", self.addr, self.election_path)
-		my_logger.debug("%s sorted children is %s", self.addr, self.get_sorted_children())
+		if election_id < self.election_id:
+			my_logger.debug("%s ignored election my election id is %s remote is %s",self.addr, self.election_id, election_id)
+		else:
+			self.election_id = election_id
 
 		if self.primary_path == primary_path:
 			my_logger.debug("%s already got path %s as primary_path, ignored ", self.addr, primary_path)
 			return
+
 		else:
 			my_logger.debug("%s setting my primary to %s with path %s ",self.addr, is_primary, primary_path)
 			self.is_primary = is_primary
@@ -676,13 +709,15 @@ class storageServer(object):
 				try:
 					r_primary_addr = primary_conn.get_primary_addr()
 					my_logger.debug("%s primary_addr %s confirmed primary is %s",self.addr, primary_addr, r_primary_addr )
+
 				except zerorpc.TimeoutExpired:
 					#primary not reachable or already new election running, wait
 					my_logger.debug("%s primary_addr %s not reachable, timeout ",self.addr, primary_addr )
 					return
+
 				if r_primary_addr == primary_addr and r_primary_addr != self.addr:
-						my_logger.debug("%s primary_addr %s confirmed getting oplog now!",self.addr, primary_addr)
-						self.backup_get_oplog(r_primary_addr)
+					my_logger.debug("%s primary_addr %s confirmed getting oplog now!",self.addr, primary_addr)
+					self.backup_get_oplog(r_primary_addr)
 
 			else:
 				my_logger.debug("%s primary path %s does not exist ",self.addr, primary_path)
@@ -693,9 +728,17 @@ class storageServer(object):
 					try:
 						print "setting primary on ", server.addr
 						#todo check if they accept!
-						server.connection.set_primary(False, self.election_path)
+						server.connection.set_primary(False, self.election_path, self.election_id)
+
 					except zerorpc.TimeoutExpired:
 						print "timeout setting primary on ", server.addr
+
+	def increment_election_id(self):
+		self.zk.create(self.election_path_counter + "election_n"
+			, self.addr, ephemeral=False, sequence=True
+		)
+		election_id = len(self.zk.get_children(self.election_path_counter))
+		return election_id
 
 	def start_election(self):
 		'''
@@ -718,18 +761,23 @@ class storageServer(object):
 		if self.zk.exists(self.election_path_prefix) is None:
 			self.zk.ensure_path(self.election_path_prefix)
 
+		if self.zk.exists(self.election_path_counter) is None:
+			self.zk.ensure_path(self.election_path_counter)
+
+		self.election_id = self.increment_election_id()
+		my_logger.debug("%s my election_id is %s", self.addr, self.election_id)
+
 		self.election_path = self.zk.create(self.election_path_prefix + "guid_n"
 			, self.addr, ephemeral=True, sequence=True
 		)
 
 		my_logger.debug("%s my path is %s", self.addr, self.election_path)
 		prev_path, primary_path = self.get_prev_path()
-
 		if  prev_path is None:
-			self.set_primary(True, primary_path)
+			self.set_primary(True, primary_path, self.election_id)
 		else:
 			self.watch_node(prev_path)
-			self.set_primary(False, primary_path)
+			self.set_primary(False, primary_path, self.election_id)
 
 
 if __name__ == '__main__':
